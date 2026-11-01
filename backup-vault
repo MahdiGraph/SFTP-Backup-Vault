@@ -39,7 +39,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 PROJECT = "https://github.com/MahdiGraph/SFTP-Backup-Vault"
 
 # The tests move every path below a temporary folder and run without root.
@@ -1096,7 +1096,15 @@ def reload_sshd() -> None:
     run(["systemctl", "try-reload-or-restart", sshd_unit()])
 
 
+def sshd_ready() -> None:
+    """sshd -t and -T need its privilege separation folder, which systemd makes only when sshd starts:
+    on Ubuntu 24.04 (socket activation) not before the first connection."""
+    if not TESTING and not os.path.isdir("/run/sshd"):
+        os.makedirs("/run/sshd", mode=0o755, exist_ok=True)
+
+
 def sshd_valid() -> bool:
+    sshd_ready()
     result = subprocess.run([SSHD, "-t"], capture_output=True, text=True)
     if result.returncode != 0:
         log("error", f"sshd -t: {result.stderr.strip()}")
@@ -1283,6 +1291,7 @@ def copy_out(cfg: Config, name: str, wanted: str, destination: str) -> int:
 
 
 def sshd_effective(user: str, address: str) -> str:
+    sshd_ready()
     result = subprocess.run([SSHD, "-T", "-C", f"user={user},host={address},addr={address}"], capture_output=True, text=True)
     return result.stdout.lower()
 
@@ -1311,6 +1320,7 @@ def remove_selftest_account() -> None:
 
 def selftest_endpoint() -> tuple[str, str]:
     """Where sshd listens on this machine: loopback when it listens on every address."""
+    sshd_ready()
     listen = [line.split()[1] for line in subprocess.run([SSHD, "-T"], capture_output=True, text=True).stdout.splitlines() if line.startswith("listenaddress ")]
     for value in listen:
         address, _, port = value.rpartition(":")

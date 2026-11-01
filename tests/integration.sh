@@ -8,12 +8,7 @@ here=$(cd "$(dirname "$0")/.." && pwd)
 say() { printf '\n== %s\n' "$*"; }
 fail() { printf '\nFAIL: %s\n' "$*" >&2; exit 1; }
 
-say "An SSH server"
-if ! command -v sshd > /dev/null && [ ! -x /usr/sbin/sshd ]; then
-  DEBIAN_FRONTEND=noninteractive apt-get update -qq
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server
-fi
-systemctl enable --now ssh.service 2> /dev/null || systemctl enable --now sshd.service
+# No SSH server started beforehand: the installer handles one that never ran since boot (or is missing).
 
 say "Install"
 "$here/install.sh" --yes

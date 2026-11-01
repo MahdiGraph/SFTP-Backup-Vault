@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.1 (2026-11-01)
+
+- The installer stopped with «sshd's current settings fail sshd -t» on a machine whose sshd had not
+  started since boot, as on Ubuntu 24.04 (socket activation) before the first SSH connection: sshd -t
+  needs /run/sshd, which systemd creates only when sshd starts. The installer, the uninstaller and
+  backup-vault now create it when it is missing.
+- The CI's end-to-end test no longer starts sshd before installing, so it covers that case.
+
 ## 1.0.0 (2026-11-01)
 
 First public release.

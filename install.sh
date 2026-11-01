@@ -15,7 +15,7 @@
 set -euo pipefail
 umask 022
 
-VERSION=1.0.0
+VERSION=1.0.1
 REPO=MahdiGraph/SFTP-Backup-Vault
 GROUP=sftp_backups
 SSHD_DIR=/etc/ssh/sshd_config.d
@@ -132,6 +132,9 @@ read -r major minor <<< "${ssh_version:-0 0}"
 [ "$major" -gt 7 ] || { [ "$major" = 7 ] && [ "$minor" -ge 8 ]; } || die "OpenSSH 7.8 or newer is needed (found ${major}.${minor})"
 grep -qiE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf' /etc/ssh/sshd_config \
   || die "/etc/ssh/sshd_config does not include $SSHD_DIR/*.conf; add the line «Include $SSHD_DIR/*.conf» at its top, then run this again"
+# sshd -t needs its privilege separation folder, which systemd creates only when sshd starts: on
+# Ubuntu 24.04 (socket activation) not before the first connection.
+[ -d /run/sshd ] || install -d -m 0755 /run/sshd
 "$SSHD" -t || die "sshd's current settings fail «sshd -t»; fix them first"
 echo "OpenSSH ${major}.${minor}, $(python3 --version), packages: ${manager:-unknown}"
 

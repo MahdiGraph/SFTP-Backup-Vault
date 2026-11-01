@@ -60,6 +60,7 @@ systemctl daemon-reload
 
 say "SSH rules"
 rm -f "$SSHD_DIR/40-backup-vault.conf" "$SSHD_DIR/41-backup-vault-access.conf"
+[ -d /run/sshd ] || install -d -m 0755 /run/sshd
 if /usr/sbin/sshd -t; then
   for unit in ssh.service sshd.service; do
     if systemctl cat "$unit" > /dev/null 2>&1; then
