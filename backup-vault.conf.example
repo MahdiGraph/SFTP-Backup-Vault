@@ -1,0 +1,45 @@
+# SFTP Backup Vault settings: /etc/backup-vault/backup-vault.conf (guide: /etc/backup-vault/README.md).
+# Changes take effect at the next run of the timers. Check them with:  sudo backup-vault policy
+# After changing allow_from, or adding an account section by hand, run: sudo backup-vault apply
+
+[retention]
+# Rotation runs every night at 05:15. Of each account's backups it keeps:
+#   every backup received in the last keep_all_days days;
+#   then the newest backup of each of the last `daily` days, `weekly` weeks, `monthly` months and
+#   `yearly` years (counted back from today: a flood of uploads cannot push old backups out);
+#   and always the account's newest keep_last backups, however old (at least 1).
+# What it does not keep waits trash_days days in /var/backups/vault/.trash, then is deleted for good.
+keep_all_days = 7
+daily = 30
+weekly = 12
+monthly = 12
+yearly = 3
+keep_last = 7
+trash_days = 7
+
+[ingest]
+# A finished upload moves into the vault once closed and unchanged for this many seconds.
+settle_seconds = 120
+# `status` and the login message warn when an account has sent nothing for this many hours (0: never)...
+alert_hours = 30
+# ...and when the disk has less free space than this percentage.
+min_free_percent = 15
+
+[server]
+# The address and port your backup clients connect to, shown by `backup-vault add-user`.
+#public_host = backup.example.com
+#public_port = 22
+
+# One section per backup account (a user of the group sftp_backups); `backup-vault add-user` writes it.
+# Any [retention] or [ingest] setting may be given there for that account alone.
+#   set_by     = file: each uploaded file is one backup (the default);
+#                folder: each top folder under upload/ is one backup (a set of files)
+#   discard    = patterns (comma-separated) of uploads that go straight to the trash, e.g. connection tests
+#   allow_from = the client's address(es) or networks: the account logs in only from there, and from
+#                there only backup accounts log in. Set it with:  sudo backup-vault set-ip ACCOUNT ADDRESS
+#
+# [account site1]
+# set_by = folder
+# discard = connection-test-*.txt
+# allow_from = 203.0.113.10
+# daily = 60

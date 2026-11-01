@@ -1,0 +1,14 @@
+[Unit]
+Description=backup-vault: rotate the backups and empty the old trash
+Documentation=file:/etc/backup-vault/README.md https://github.com/MahdiGraph/SFTP-Backup-Vault
+After=time-sync.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/backup-vault rotate
+Nice=10
+IOSchedulingClass=idle
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes

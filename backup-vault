@@ -1,0 +1,1514 @@
+#!/usr/bin/python3
+"""backup-vault (SFTP Backup Vault): SFTP accounts that can only add backups, and their rotation.
+
+Backup accounts (the group sftp_backups) log in over SFTP, chrooted to /var/backups/sftp/<account>,
+and can only add files under its upload/ folder: sshd refuses reading, deleting, links and copies
+(/etc/ssh/sshd_config.d/40-backup-vault.conf). Every minute `ingest` moves each finished upload out
+of their reach into /var/backups/vault/<account> (root only, read-only and immutable) and records its
+size and SHA-256. Every night `rotate` keeps a grandfather-father-son selection of each account's
+backups and moves the rest to /var/backups/vault/.trash, which is emptied after some days.
+
+Settings: /etc/backup-vault/backup-vault.conf. Guide: /etc/backup-vault/README.md and
+https://github.com/MahdiGraph/SFTP-Backup-Vault (MIT licence).
+"""
+
+from __future__ import annotations
+
+import argparse
+import configparser
+import datetime as dt
+import errno
+import fcntl
+import fnmatch
+import grp
+import hashlib
+import ipaddress
+import json
+import os
+import pwd
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import zipfile
+import zlib
+from collections import Counter, defaultdict
+from dataclasses import dataclass
+from pathlib import Path
+
+VERSION = "1.0.0"
+PROJECT = "https://github.com/MahdiGraph/SFTP-Backup-Vault"
+
+# The tests move every path below a temporary folder and run without root.
+ROOT = Path(os.environ.get("BACKUP_VAULT_ROOT", "/"))
+TESTING = ROOT != Path("/")
+
+
+def _path(path: str) -> Path:
+    return ROOT / path.lstrip("/")
+
+
+SFTP_ROOT = _path("/var/backups/sftp")
+VAULT = _path("/var/backups/vault")
+TRASH = VAULT / ".trash"
+STATE = _path("/var/lib/backup-vault")
+CONF_DIR = _path("/etc/backup-vault")
+CONF = CONF_DIR / "backup-vault.conf"
+KEYS = CONF_DIR / "keys"
+SSHD_ACCESS = _path("/etc/ssh/sshd_config.d/41-backup-vault-access.conf")
+RSYSLOG = _path("/etc/rsyslog.d/40-backup-vault.conf")
+LOCK = _path("/run/backup-vault.lock")
+SSHD = "/usr/sbin/sshd"
+GROUP = "sftp_backups"
+UPLOAD = "upload"
+SELFTEST = "bv_selftest"
+# A folder left empty under upload/ this long is removed; a client may be about to fill a newer one.
+EMPTY_DIR_SECONDS = 600
+# Checksum lists read in a backup folder; anything bigger is not a checksum list.
+MANIFEST_MAX_BYTES = 1 << 20
+# A gzip whose content grows past 1000 times its size (and 64 MiB) is not decompressed to the end: a bomb.
+GZIP_MAX_RATIO = 1000
+SELFTEST_COMMENT = "backup-vault self-test (temporary)"
+ACCOUNT_NAME = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+LEVELS = {"error": 3, "warning": 4, "notice": 5, "info": 6}
+
+# Every setting and its default. [account <name>] may override any retention or ingest setting.
+DEFAULTS: dict[str, dict[str, object]] = {
+    "retention": {"keep_all_days": 7, "daily": 30, "weekly": 12, "monthly": 12, "yearly": 3, "keep_last": 7, "trash_days": 7},
+    "ingest": {"settle_seconds": 120, "alert_hours": 30, "min_free_percent": 15},
+    "account": {"set_by": "file", "discard": "", "allow_from": ""},
+    "server": {"public_host": "", "public_port": 22},
+}
+NUMBERS = {key for part in ("retention", "ingest") for key in DEFAULTS[part]} | {"public_port"}
+
+
+class Failure(Exception):
+    """A refused command: the message says why."""
+
+
+# ---------------------------------------------------------------- output
+
+
+def to_journal() -> bool:
+    """stdout is the journal (a systemd service): JOURNAL_STREAM names it."""
+    try:
+        device, inode = (int(x) for x in os.environ.get("JOURNAL_STREAM", "").split(":"))
+        st = os.fstat(sys.stdout.fileno())
+    except (ValueError, OSError):
+        return False
+    return (st.st_dev, st.st_ino) == (device, inode)
+
+
+UNDER_SYSTEMD = to_journal()
+
+
+def log(level: str, message: str) -> None:
+    """One line; under systemd its syslog level goes first, so the journal files it right."""
+    if UNDER_SYSTEMD:
+        print(f"<{LEVELS[level]}>{message}", flush=True)
+    elif level in ("error", "warning"):
+        print(f"{level}: {message}", file=sys.stderr, flush=True)
+    else:
+        print(message, flush=True)
+
+
+def show(value: object) -> str:
+    """A name from an upload, safe to print: control characters (a forged log line) become «?»."""
+    return re.sub(r"[\x00-\x1f\x7f]", "?", str(value))
+
+
+def human(size: float) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(size) < 1024 or unit == "TB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return ""
+
+
+def ago(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    if seconds < 3600:
+        return f"{seconds // 60:.0f} min"
+    if seconds < 2 * 86400:
+        return f"{seconds / 3600:.0f} h"
+    return f"{seconds / 86400:.0f} days"
+
+
+def when(timestamp: float) -> str:
+    return dt.datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M")
+
+
+def iso(timestamp: float) -> str:
+    return dt.datetime.fromtimestamp(timestamp).astimezone().isoformat(timespec="seconds")
+
+
+def split_list(value: str) -> list[str]:
+    return [item for item in re.split(r"[\s,]+", value.strip()) if item]
+
+
+# ---------------------------------------------------------------- settings
+
+
+@dataclass
+class Account:
+    name: str
+    values: dict[str, str]
+
+    def number(self, key: str) -> int:
+        return int(self.values[key])
+
+    @property
+    def set_by(self) -> str:
+        return self.values["set_by"]
+
+    @property
+    def allow_from(self) -> list[str]:
+        return split_list(self.values["allow_from"])
+
+    def discards(self, rel: Path) -> bool:
+        patterns = [p.strip() for p in self.values["discard"].split(",") if p.strip()]
+        return any(fnmatch.fnmatchcase(str(rel), p) or fnmatch.fnmatchcase(rel.name, p) for p in patterns)
+
+    @property
+    def chroot(self) -> Path:
+        return SFTP_ROOT / self.name
+
+    @property
+    def upload(self) -> Path:
+        return self.chroot / UPLOAD
+
+    @property
+    def vault(self) -> Path:
+        return VAULT / self.name
+
+
+def check_value(section: str, key: str, value: str) -> None:
+    where = f"[{section}] {key} = {value}"
+    if key in NUMBERS:
+        try:
+            number = int(value)
+        except ValueError:
+            raise Failure(f"{where}: a whole number is needed") from None
+        if number < 0 or (key == "keep_last" and number < 1) or (key == "min_free_percent" and number > 100) or (key == "public_port" and not 0 < number < 65536):
+            raise Failure(f"{where}: out of range" + (" (at least 1: the newest backup is always kept)" if key == "keep_last" else ""))
+    elif key == "set_by" and value not in ("file", "folder"):
+        raise Failure(f"{where}: file or folder")
+    elif key == "allow_from":
+        for item in split_list(value):
+            try:
+                ipaddress.ip_network(item, strict=False)
+            except ValueError:
+                raise Failure(f"{where}: {item} is not an IP address or network") from None
+
+
+class Config:
+    def __init__(self, path: Path = CONF):
+        self.path = path
+        self.parser = configparser.ConfigParser(interpolation=None, default_section="-")
+        if path.exists():
+            try:
+                with path.open(encoding="utf-8") as fh:
+                    self.parser.read_file(fh)
+            except configparser.Error as e:
+                raise Failure(f"{path}: {e}") from None
+        for section in self.parser.sections():
+            kind, _, name = section.partition(" ")
+            if kind == "account" and name.strip():
+                if not ACCOUNT_NAME.match(name.strip()):
+                    raise Failure(f"{path}: [{section}]: not a valid account name")
+                allowed = {**DEFAULTS["retention"], **DEFAULTS["ingest"], **DEFAULTS["account"]}
+            elif section in ("retention", "ingest", "server"):
+                allowed = DEFAULTS[section]
+            else:
+                raise Failure(f"{path}: unknown section [{section}]")
+            for key, value in self.parser.items(section):
+                if key not in allowed:
+                    raise Failure(f"{path}: [{section}] {key}: unknown setting")
+                check_value(section, key, value)
+
+    def server(self, key: str) -> str:
+        return self.parser.get("server", key, fallback=str(DEFAULTS["server"][key]))
+
+    def configured(self) -> list[str]:
+        return sorted(s.partition(" ")[2].strip() for s in self.parser.sections() if s.startswith("account "))
+
+    def account(self, name: str) -> Account:
+        values = {key: str(value) for part in ("retention", "ingest", "account") for key, value in DEFAULTS[part].items()}
+        for section in ("retention", "ingest", f"account {name}"):
+            if self.parser.has_section(section):
+                values.update(self.parser.items(section))
+        return Account(name, values)
+
+    def accounts(self, selftest: bool = False) -> list[Account]:
+        """The backup accounts: the group's members (in the tests, the configured ones); the self-test's when asked."""
+        names = set(self.configured()) if TESTING else group_members()
+        return [self.account(name) for name in sorted(names) if selftest or name != SELFTEST]
+
+
+def group_members() -> set[str]:
+    try:
+        group = grp.getgrnam(GROUP)
+    except KeyError:
+        return set()
+    return set(group.gr_mem) | {user.pw_name for user in pwd.getpwall() if user.pw_gid == group.gr_gid}
+
+
+# ---------------------------------------------------------------- history
+
+
+def record(account: str, event: str, **fields: object) -> None:
+    """The account's history: what arrived (with its SHA-256), checks, rotations, deletions."""
+    STATE.mkdir(parents=True, exist_ok=True)
+    line = json.dumps({"at": iso(time.time()), "event": event, **fields}, ensure_ascii=False)
+    with (STATE / f"{account}.jsonl").open("a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
+
+
+def history(account: str) -> list[dict]:
+    entries = []
+    try:
+        with (STATE / f"{account}.jsonl").open(encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    entries.append(json.loads(line))
+                except ValueError:
+                    continue
+    except FileNotFoundError:
+        pass
+    return entries
+
+
+def stored_hashes(account: str) -> dict[str, str]:
+    return {e["path"]: e["sha256"] for e in history(account) if e.get("event") == "stored" and "path" in e and "sha256" in e}
+
+
+# ---------------------------------------------------------------- files
+
+
+def scan(top: Path) -> tuple[list[tuple[Path, os.stat_result]], list[tuple[Path, os.stat_result]], list[Path]]:
+    """Regular files, other entries (links, pipes...) and folders (deepest first) below top."""
+    files: list[tuple[Path, os.stat_result]] = []
+    others: list[tuple[Path, os.stat_result]] = []
+    folders: list[Path] = []
+
+    def walk(folder: Path) -> None:
+        try:
+            with os.scandir(folder) as it:
+                entries = sorted(it, key=lambda e: e.name)
+        except (FileNotFoundError, NotADirectoryError):
+            return
+        for entry in entries:
+            path = Path(entry.path)
+            try:
+                st = os.lstat(path)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISDIR(st.st_mode):
+                walk(path)
+                folders.append(path)
+            elif stat.S_ISREG(st.st_mode):
+                files.append((path, st))
+            else:
+                others.append((path, st))
+
+    walk(top)
+    return files, others, folders
+
+
+def open_inodes() -> set[tuple[int, int]]:
+    """(device, inode) of every regular file a process holds open, such as an upload being written."""
+    found = set()
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            fds = os.listdir(f"/proc/{pid}/fd")
+        except FileNotFoundError:
+            continue
+        except PermissionError:
+            if TESTING:
+                continue
+            raise  # without seeing every process, a file still being written could be taken
+        for fd in fds:
+            try:
+                st = os.stat(f"/proc/{pid}/fd/{fd}")
+            except OSError:
+                continue
+            if stat.S_ISREG(st.st_mode):
+                found.add((st.st_dev, st.st_ino))
+    return found
+
+
+def unique(path: Path) -> Path:
+    """path, or path with ~2, ~3... before its extensions when it is taken: nothing is overwritten."""
+    if not os.path.lexists(path):
+        return path
+    dot = path.name.find(".", 1)
+    stem, rest = (path.name, "") if dot < 0 else (path.name[:dot], path.name[dot:])
+    n = 2
+    while os.path.lexists(path.with_name(f"{stem}~{n}{rest}")):
+        n += 1
+    return path.with_name(f"{stem}~{n}{rest}")
+
+
+def immutable(path: Path, on: bool) -> bool:
+    """chattr +i/-i: an immutable file cannot be changed, renamed or deleted, even by root, until -i."""
+    if TESTING:
+        return True
+    result = subprocess.run(["chattr", "+i" if on else "-i", str(path)], capture_output=True, text=True)
+    if result.returncode != 0:
+        log("warning", f"chattr {'+' if on else '-'}i {show(path)}: {result.stderr.strip()}")
+    return result.returncode == 0
+
+
+def is_immutable(path: Path) -> bool:
+    result = subprocess.run(["lsattr", "-d", str(path)], capture_output=True, text=True)
+    return result.returncode == 0 and "i" in result.stdout.split()[0]
+
+
+def unlock_tree(path: Path) -> None:
+    if not TESTING and path.exists():
+        subprocess.run(["chattr", "-R", "-i", str(path)], capture_output=True)
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def check_archive(path: Path) -> str | None:
+    """Whether a zip, gzip or tar arrived whole: an upload that broke off leaves one cut short."""
+    name = path.name.lower()
+    try:
+        if name.endswith(".zip"):
+            # The central directory sits at the very end: a zip cut short has none.
+            return "zip ok" if zipfile.is_zipfile(path) else "zip damaged or incomplete"
+        if name.endswith((".gz", ".tgz")):
+            return gzip_check(path)
+        if name.endswith(".tar"):
+            # A tar ends with two empty 512-byte blocks.
+            size = path.stat().st_size
+            with path.open("rb") as fh:
+                fh.seek(max(0, size - 1024))
+                return "tar ok" if size >= 1024 and size % 512 == 0 and fh.read(1024) == bytes(1024) else "tar damaged or incomplete"
+    except OSError:
+        return f"{name.rsplit('.', 1)[-1]} unreadable"
+    return None
+
+
+def gzip_check(path: Path) -> str:
+    """Decompresses every member to the end, keeping at most 1 MiB of output at a time."""
+    budget = path.stat().st_size * GZIP_MAX_RATIO + (64 << 20)
+    produced = 0
+    ended = False
+    try:
+        with path.open("rb") as fh:
+            data = fh.read(1 << 20)
+            if data[:2] != b"\x1f\x8b":
+                return "gzip damaged or incomplete"
+            decompressor = zlib.decompressobj(zlib.MAX_WBITS | 16)
+            while True:
+                if not data:
+                    data = fh.read(1 << 20)
+                    if not data:
+                        break
+                if ended:
+                    if not data.strip(b"\0"):
+                        data = b""  # zeros after the last member, as some tools pad
+                        continue
+                    decompressor = zlib.decompressobj(zlib.MAX_WBITS | 16)
+                    ended = False
+                produced += len(decompressor.decompress(data, 1 << 20))
+                if produced > budget:
+                    return "gzip not checked (expands too much)"
+                if decompressor.eof:
+                    ended, data = True, decompressor.unused_data
+                else:
+                    data = decompressor.unconsumed_tail
+    except zlib.error:
+        return "gzip damaged or incomplete"
+    return "gzip ok" if ended else "gzip damaged or incomplete"
+
+
+def free_dir(path: Path) -> Path:
+    """path, or path~2, ~3...: the first that is already a folder or free (a file may hold the name)."""
+    candidate, n = path, 2
+    while os.path.lexists(candidate) and not candidate.is_dir():
+        candidate = path.with_name(f"{path.name}~{n}")
+        n += 1
+    return candidate
+
+
+def vault_target(account: Account, rel: Path) -> Path:
+    """Where an upload goes in the vault: its own path, made unique; nothing there is overwritten."""
+    folder = account.vault
+    for part in rel.parts[:-1]:
+        folder = free_dir(folder / part)
+    return unique(folder / rel.name)
+
+
+def make_private_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)  # the umask (077) keeps every new level root's alone
+
+
+def move(source: Path, target: Path) -> None:
+    try:
+        os.rename(source, target)
+    except OSError as e:
+        if e.errno != errno.EXDEV:
+            raise
+        part = target.with_name(target.name + ".part")
+        shutil.copyfile(source, part)
+        with part.open("rb") as fh:
+            os.fsync(fh.fileno())
+        os.rename(part, target)
+        source.unlink()
+
+
+def seal(path: Path, arrival: float) -> None:
+    """root's, read-only, dated by its arrival, immutable."""
+    if not TESTING:
+        os.chown(path, 0, 0)
+    os.chmod(path, 0o400)
+    os.utime(path, (arrival, arrival))
+    immutable(path, True)
+
+
+def remove_empty_dirs(top: Path, stop: Path, now: float, immediately: bool) -> None:
+    """Folders left empty below top (deepest first), never stop itself."""
+    folders = scan(top)[2] + ([top] if top != stop else [])
+    for folder in folders:
+        try:
+            if os.listdir(folder):
+                continue
+            if not immediately and now - os.lstat(folder).st_mtime < EMPTY_DIR_SECONDS:
+                continue
+            os.rmdir(folder)
+        except OSError:
+            continue
+
+
+def remove_empty_parents(path: Path, stop: Path) -> None:
+    parent = path.parent
+    while parent != stop and stop in parent.parents:
+        try:
+            parent.rmdir()
+        except OSError:
+            return
+        parent = parent.parent
+
+
+def today() -> str:
+    return dt.date.today().isoformat()
+
+
+def to_trash(account: str, rel: Path, source: Path) -> Path:
+    target = unique(TRASH / today() / account / rel)
+    make_private_dir(target.parent)
+    move(source, target)
+    if not TESTING:
+        os.chown(target, 0, 0)
+    os.chmod(target, 0o400)
+    return target
+
+
+# ---------------------------------------------------------------- ingest
+
+
+def set_name(account: Account, rel: Path) -> str:
+    """The backup a file belongs to: its top folder (set_by = folder) or the file itself."""
+    return rel.parts[0] if account.set_by == "folder" and len(rel.parts) > 1 else str(rel)
+
+
+def ingest(cfg: Config, only: set[str] | None = None, migrate: bool = False, settle: int | None = None) -> int:
+    """Moves every finished upload into the vault: closed by its writer and unchanged for settle_seconds.
+
+    With migrate (the first run over files from before backup-vault), a file is finished once closed
+    and arrived at its modification time; otherwise it arrived when it last changed (ctime, which a
+    client cannot set).
+    """
+    now = time.time()
+    busy = open_inodes()
+    problems = 0
+    for account in cfg.accounts(selftest=bool(only and SELFTEST in only)):
+        if (only and account.name not in only) or not account.upload.is_dir():
+            continue
+        files, others, _ = scan(account.upload)
+        for path, _ in others:
+            path.unlink(missing_ok=True)
+            log("warning", f"{account.name}: removed {show(path.relative_to(account.upload))}, which is not a regular file")
+        touched = set()
+        for path, st in files:
+            rel = path.relative_to(account.upload)
+            if (st.st_dev, st.st_ino) in busy:
+                continue  # still being written
+            wait = account.number("settle_seconds") if settle is None else settle
+            if not migrate and now - max(st.st_mtime, st.st_ctime) < wait:
+                continue
+            if st.st_nlink > 1:
+                problems += 1
+                log("error", f"{account.name}: {show(rel)} has {st.st_nlink} hard links; left where it is")
+                continue
+            arrival = st.st_mtime if migrate else st.st_ctime
+            try:
+                if account.discards(rel):
+                    to_trash(account.name, rel, path)
+                    record(account.name, "discarded", path=str(rel), bytes=st.st_size)
+                    log("notice", f"{account.name}: put {show(rel)} in the trash (a discard pattern)")
+                    continue
+                target = vault_target(account, rel)
+                make_private_dir(target.parent)
+                move(path, target)
+                seal(target, arrival)
+                if (st.st_dev, st.st_ino) in open_inodes():
+                    log("warning", f"{account.name}: {show(rel)} was opened again while it was moved; check this backup")
+                digest = sha256(target)
+                check = check_archive(target)
+                stored = target.relative_to(account.vault)
+                extra = {"check": check} if check else {}
+                record(account.name, "stored", path=str(stored), received=iso(arrival), bytes=st.st_size, sha256=digest, **({"migrated": True} if migrate else {}), **extra)
+                level = "warning" if check and not check.endswith(" ok") else "notice"
+                log(level, f"{account.name}: stored {show(stored)} ({human(st.st_size)}{', ' + check if check else ''})")
+                touched.add(set_name(account, stored))
+            except OSError as e:
+                problems += 1
+                log("error", f"{account.name}: could not store {show(rel)}: {e}")
+        for name in sorted(touched):
+            check_manifest(account, name)
+        remove_empty_dirs(account.upload, account.upload, now, immediately=migrate)
+    return 1 if problems else 0
+
+
+CHECKSUM_LISTS = ("sha256sums", "sha256sums.txt", "checksums.sha256", "sha256sum.txt")
+SUM_LINE = re.compile(r"^([0-9a-fA-F]{64}) [ *](.+)$")
+BSD_SUM_LINE = re.compile(r"^SHA256 \((.+)\) = ([0-9a-fA-F]{64})$")
+
+
+def listed_checksums(folder: Path) -> tuple[dict[str, str], list[str]]:
+    """The SHA-256 a backup folder lists for its own files, and the lists it came from.
+
+    sha256sum's output (SHA256SUMS, *.sha256, both its styles) and manifest.json: any object in it with
+    a 64-hex "sha256" and a "file", "path" or "name". Names are relative to the folder; one that
+    climbs out of it is ignored.
+    """
+    expected: dict[str, str] = {}
+    sources = []
+    try:
+        entries = sorted(folder.iterdir())
+    except OSError:
+        return expected, sources
+    for path in entries:
+        lower = path.name.lower()
+        if not path.is_file() or path.stat().st_size > MANIFEST_MAX_BYTES:
+            continue
+        found: dict[str, str] = {}
+        if lower in CHECKSUM_LISTS or lower.endswith(".sha256"):
+            for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = line.strip()
+                if match := SUM_LINE.match(line):
+                    found[match.group(2)] = match.group(1).lower()
+                elif match := BSD_SUM_LINE.match(line):
+                    found[match.group(1)] = match.group(2).lower()
+        elif lower == "manifest.json":
+            try:
+                collect_json_checksums(json.loads(path.read_text(encoding="utf-8")), found, 0)
+            except ValueError:
+                log("warning", f"{path.parent.name}/{path.name} does not read as JSON")
+        for name, digest in found.items():
+            name = name[2:] if name.startswith("./") else name
+            if name and not name.startswith("/") and ".." not in Path(name).parts:
+                expected[name] = digest
+        if found:
+            sources.append(path.name)
+    return expected, sources
+
+
+def collect_json_checksums(node: object, found: dict[str, str], depth: int) -> None:
+    if depth > 20:
+        return
+    if isinstance(node, dict):
+        name = next((node[k] for k in ("file", "path", "name") if isinstance(node.get(k), str)), None)
+        digest = node.get("sha256")
+        if name and isinstance(digest, str) and re.fullmatch(r"[0-9a-fA-F]{64}", digest):
+            found[name] = digest.lower()
+        for value in node.values():
+            collect_json_checksums(value, found, depth + 1)
+    elif isinstance(node, list):
+        for value in node:
+            collect_json_checksums(value, found, depth + 1)
+
+
+def check_manifest(account: Account, name: str) -> None:
+    """A backup folder that lists its files' SHA-256 (SHA256SUMS, manifest.json) is compared with what arrived."""
+    folder = account.vault / name
+    if not folder.is_dir():
+        return
+    expected, sources = listed_checksums(folder)
+    if not expected:
+        return
+    hashes = stored_hashes(account.name)
+    missing = [f for f in expected if f"{name}/{f}" not in hashes]
+    wrong = [f for f, digest in expected.items() if f"{name}/{f}" in hashes and hashes[f"{name}/{f}"] != digest]
+    if wrong:
+        result = "mismatch"
+        log("error", f"{account.name}: {show(name)}: {show(', '.join(wrong))} differ from {', '.join(sources)} (damaged on the way?)")
+    elif missing:
+        result = "incomplete"
+        log("warning", f"{account.name}: {show(name)}: {show(', '.join(missing))} not arrived yet")
+    else:
+        result = "verified"
+        log("notice", f"{account.name}: {show(name)} matches {', '.join(sources)}")
+    record(account.name, "checked", set=name, result=result, lists=sources)
+
+
+# ---------------------------------------------------------------- backups and rotation
+
+
+@dataclass
+class BackupSet:
+    name: str
+    path: Path
+    files: list[Path]
+    arrival: float
+    size: int
+
+    @property
+    def series(self) -> str:
+        """Backups whose names differ only in numbers (dates, counters) form one series."""
+        return re.sub(r"\d+", "#", re.sub(r"~\d+", "", self.name))
+
+
+def collect_sets(account: Account, base: Path | None = None) -> list[BackupSet]:
+    base = base or account.vault
+    groups: dict[str, list[tuple[Path, os.stat_result]]] = defaultdict(list)
+    for path, st in scan(base)[0]:
+        groups[set_name(account, path.relative_to(base))].append((path, st))
+    sets = [
+        BackupSet(name, base / name, [p for p, _ in items], min(st.st_mtime for _, st in items), sum(st.st_size for _, st in items))
+        for name, items in groups.items()
+    ]
+    return sorted(sets, key=lambda s: (s.arrival, s.name))
+
+
+def shift_month(day: dt.datetime, months: int) -> tuple[int, int]:
+    index = day.year * 12 + day.month - 1 + months
+    return index // 12, index % 12 + 1
+
+
+def plan(account: Account, sets: list[BackupSet], now: dt.datetime) -> dict[str, str]:
+    """The backups to keep, each with its reason; the rest goes to the trash.
+
+    Grandfather-father-son by time windows: everything from the last keep_all_days days, then the
+    newest backup of each of the last `daily` days, `weekly` weeks, `monthly` months and `yearly`
+    years (in each series), and the newest keep_last backups of the account. Windows count back from
+    now, so a flood of new uploads cannot push older backups out sooner.
+    """
+    local = {s.name: dt.datetime.fromtimestamp(s.arrival) for s in sets}
+    keep: dict[str, str] = {}
+    recent = now - dt.timedelta(days=account.number("keep_all_days"))
+    for s in sets:
+        if local[s.name] >= recent:
+            keep[s.name] = "recent"
+    rules = [
+        ("daily", lambda d: d.date(), {(now - dt.timedelta(days=i)).date() for i in range(account.number("daily"))}),
+        ("weekly", lambda d: tuple(d.isocalendar())[:2], {tuple((now - dt.timedelta(weeks=i)).isocalendar())[:2] for i in range(account.number("weekly"))}),
+        ("monthly", lambda d: (d.year, d.month), {shift_month(now, -i) for i in range(account.number("monthly"))}),
+        ("yearly", lambda d: d.year, {now.year - i for i in range(account.number("yearly"))}),
+    ]
+    series: dict[str, list[BackupSet]] = defaultdict(list)
+    for s in sets:
+        series[s.series].append(s)
+    for members in series.values():
+        members.sort(key=lambda s: s.arrival, reverse=True)
+        for label, bucket, window in rules:
+            taken = set()
+            for s in members:
+                b = bucket(local[s.name])
+                if b in window and b not in taken:
+                    taken.add(b)
+                    keep.setdefault(s.name, label)
+    for s in sorted(sets, key=lambda s: s.arrival, reverse=True)[: account.number("keep_last")]:
+        keep.setdefault(s.name, "newest")
+    return keep
+
+
+def clock_trusted() -> tuple[bool, str]:
+    """Rotation deletes by age: it waits while the clock is not synchronised."""
+    if TESTING:
+        return True, ""
+    try:
+        out = subprocess.run(["timedatectl", "show", "-p", "NTPSynchronized", "--value"], capture_output=True, text=True, timeout=15).stdout.strip()
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, f"timedatectl did not answer ({e})"
+    return out == "yes", f"the clock is not synchronised (NTPSynchronized={out or '?'})"
+
+
+def trash_set(account: Account, backup: BackupSet) -> Path:
+    for path in backup.files:
+        immutable(path, False)
+    target = unique(TRASH / today() / account.name / backup.name)
+    make_private_dir(target.parent)
+    os.rename(backup.path, target)
+    remove_empty_parents(backup.path, account.vault)
+    return target
+
+
+def rotate(cfg: Config, dry_run: bool = False, force: bool = False, only: set[str] | None = None) -> int:
+    if not dry_run and not force:
+        trusted, why = clock_trusted()
+        if not trusted:
+            log("warning", f"not rotating: {why}")
+            return 1
+    now = dt.datetime.now()
+    status = 0
+    for account in cfg.accounts():
+        if only and account.name not in only:
+            continue
+        sets = collect_sets(account)
+        if not sets:
+            continue
+        if max(s.arrival for s in sets) > now.timestamp() + 86400 and not force:
+            log("error", f"{account.name}: its newest backup is dated after now; is the clock wrong? Not rotating it")
+            status = 1
+            continue
+        keep = plan(account, sets, now)
+        drop = [s for s in sets if s.name not in keep]
+        reasons = ", ".join(f"{n} {r}" for r, n in sorted(Counter(keep.values()).items()))
+        if dry_run:
+            print(f"{account.name}: keeps {len(keep)} of {len(sets)} ({reasons}); would put {len(drop)} in the trash ({human(sum(s.size for s in drop))})")
+            for s in drop:
+                print(f"    {when(s.arrival)}  {human(s.size):>9}  {show(s.name)}")
+            continue
+        for s in drop:
+            try:
+                target = trash_set(account, s)
+            except OSError as e:
+                status = 1
+                log("error", f"{account.name}: could not move {show(s.name)} to the trash: {e}")
+                continue
+            record(account.name, "rotated", set=s.name, received=iso(s.arrival), bytes=s.size, trash=str(target.relative_to(VAULT)))
+            log("notice", f"{account.name}: put {show(s.name)} ({when(s.arrival)}, {human(s.size)}) in the trash")
+        log("notice", f"{account.name}: keeps {len(keep)} backups ({reasons}); {len(drop)} went to the trash")
+    purge_trash(cfg, dry_run)
+    return status
+
+
+def purge_trash(cfg: Config, dry_run: bool = False) -> None:
+    """Deletes for good what has waited in the trash longer than trash_days."""
+    if not TRASH.is_dir():
+        return
+    for day_dir in sorted(TRASH.iterdir()):
+        try:
+            age = (dt.date.today() - dt.date.fromisoformat(day_dir.name)).days
+        except ValueError:
+            continue
+        for folder in sorted(day_dir.iterdir()):
+            days = cfg.account(folder.name).number("trash_days") if ACCOUNT_NAME.match(folder.name) else int(DEFAULTS["retention"]["trash_days"])
+            if age <= days:
+                continue
+            size = sum(st.st_size for _, st in scan(folder)[0]) if folder.is_dir() else folder.stat().st_size
+            if dry_run:
+                print(f"would delete for good: {show(folder)} ({human(size)}, in the trash since {day_dir.name})")
+                continue
+            unlock_tree(folder)
+            if folder.is_dir():
+                shutil.rmtree(folder)
+            else:
+                folder.unlink()
+            record(folder.name, "purged", trash=str(folder.relative_to(VAULT)), bytes=size)
+            log("notice", f"{folder.name}: deleted for good what went to the trash on {day_dir.name} ({human(size)})")
+        if not dry_run:
+            try:
+                day_dir.rmdir()
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------- reports
+
+
+def unit_failed(unit: str) -> bool:
+    return not TESTING and subprocess.run(["systemctl", "is-failed", "--quiet", unit]).returncode == 0
+
+
+def status(cfg: Config, brief: bool = False) -> int:
+    now = time.time()
+    usage = shutil.disk_usage(VAULT if VAULT.exists() else ROOT)
+    free = usage.free * 100 / usage.total
+    rows, warnings = [], []
+    for account in cfg.accounts():
+        if account.name == SELFTEST:
+            continue
+        sets = collect_sets(account)
+        waiting = scan(account.upload)[0] if account.upload.is_dir() else []
+        newest = max((s.arrival for s in sets), default=None)
+        rows.append((account.name, len(sets), sum(s.size for s in sets), newest, len(waiting)))
+        hours = account.number("alert_hours")
+        if hours and newest is None:
+            warnings.append(f"{account.name}: no backup received yet")
+        elif hours and newest is not None and now - newest > hours * 3600:
+            warnings.append(f"{account.name}: nothing received for {ago(now - newest)}")
+        if RSYSLOG.parent.is_dir() and not (account.chroot / "dev" / "log").is_socket() and not TESTING:
+            warnings.append(f"{account.name}: its SFTP session cannot log (no {account.chroot}/dev/log); run: sudo backup-vault apply")
+    limit = int(cfg.parser.get("ingest", "min_free_percent", fallback=str(DEFAULTS["ingest"]["min_free_percent"])))
+    if free < limit:
+        warnings.append(f"disk: only {free:.0f}% free ({human(usage.free)})")
+    for unit in ("backup-vault-ingest.service", "backup-vault-rotate.service", "backup-vault-verify.service"):
+        if unit_failed(unit):
+            warnings.append(f"{unit} failed: journalctl -u {unit}")
+    if brief:
+        parts = [f"{n} {count} ({human(size)}, newest {ago(now - newest) + ' ago' if newest else '-'})" for n, count, size, newest, _ in rows]
+        print("Backups: " + " · ".join(parts + [f"disk {free:.0f}% free"]))
+    else:
+        print(f"Vault {VAULT}: {human(usage.free)} free of {human(usage.total)} ({free:.0f}%)")
+        print(f"  {'account':<16} {'backups':>7} {'size':>10}  {'newest':<16}  {'age':>8}  waiting")
+        for n, count, size, newest, waiting in rows:
+            print(f"  {n:<16} {count:>7} {human(size):>10}  {when(newest) if newest else '-':<16}  {ago(now - newest) if newest else '-':>8}  {waiting}")
+        trash = sum(st.st_size for _, st in scan(TRASH)[0]) if TRASH.is_dir() else 0
+        print(f"  trash: {human(trash)} (emptied after trash_days)")
+    for warning in warnings:
+        print(f"  ! {warning}")
+    return 1 if warnings else 0
+
+
+def list_sets(cfg: Config, name: str) -> int:
+    if name not in {a.name for a in cfg.accounts()} and not (VAULT / name).is_dir():
+        raise Failure(f"{name} is not a backup account and has no backups in {VAULT}")
+    account = cfg.account(name)
+    sets = collect_sets(account)
+    keep = plan(account, sets, dt.datetime.now())
+    checks: dict[str, str] = {}
+    for entry in history(name):
+        if entry.get("event") == "checked":
+            checks[str(entry.get("set"))] = str(entry.get("result"))
+        elif entry.get("event") == "stored" and entry.get("check"):
+            path = Path(str(entry["path"]))
+            key = set_name(account, path)
+            if checks.get(key) in (None, "zip ok"):
+                checks[key] = str(entry["check"])
+    print(f"{name}: {len(sets)} backups, {human(sum(s.size for s in sets))} (newest first)")
+    print(f"  {'received':<16}  {'size':>9}  {'check':<12}  {'kept as':<8}  name")
+    for s in reversed(sets):
+        print(f"  {when(s.arrival):<16}  {human(s.size):>9}  {checks.get(s.name, '-'):<12}  {keep.get(s.name, 'TRASH'):<8}  {show(s.name)}")
+    print("  (kept as: why the next rotation keeps it; TRASH: the next rotation puts it in the trash)")
+    return 0
+
+
+def verify(cfg: Config, only: set[str] | None = None) -> int:
+    """Hashes every file in the vault again and compares with the SHA-256 recorded when it arrived."""
+    status = 0
+    for account in cfg.accounts():
+        if only and account.name not in only:
+            continue
+        hashes = stored_hashes(account.name)
+        good = unknown = bad = 0
+        for path, _ in scan(account.vault)[0] if account.vault.is_dir() else []:
+            rel = str(path.relative_to(account.vault))
+            if rel not in hashes:
+                unknown += 1
+                log("warning", f"{account.name}: {show(rel)} has no recorded SHA-256 (not stored by backup-vault)")
+            elif sha256(path) == hashes[rel]:
+                good += 1
+            else:
+                bad += 1
+                log("error", f"{account.name}: {show(rel)} changed after it arrived (its SHA-256 differs)")
+        if bad or unknown:
+            status = 1
+        log("error" if bad else "notice", f"{account.name}: {good} files intact, {bad} changed, {unknown} unknown")
+    return status
+
+
+def policy(cfg: Config) -> int:
+    print(f"Settings: {cfg.path}")
+    for account in cfg.accounts():
+        if account.name == SELFTEST:
+            continue
+        v = account.values
+        print(f"\n[{account.name}]")
+        print(f"  a backup is one {v['set_by']}" + (f"; discarded: {v['discard']}" if v["discard"].strip() else ""))
+        print(f"  logs in from: {', '.join(account.allow_from) or 'any address the firewall lets through'}")
+        print(f"  keeps: everything from the last {v['keep_all_days']} days; the newest of each of the last {v['daily']} days, "
+              f"{v['weekly']} weeks, {v['monthly']} months, {v['yearly']} years; and always the newest {v['keep_last']}")
+        print(f"  trash: {v['trash_days']} days before deletion; upload taken after {v['settle_seconds']} s unchanged; "
+              f"warning after {v['alert_hours']} h without a backup")
+    missing = sorted(set(cfg.configured()) - {a.name for a in cfg.accounts()})
+    for name in missing:
+        print(f"\n! [account {name}] has no backup account (user in {GROUP}); it is ignored")
+    return 0
+
+
+# ---------------------------------------------------------------- administration
+
+
+def require_root() -> None:
+    if not TESTING and os.geteuid() != 0:
+        raise Failure("run it with sudo")
+
+
+def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+    result = subprocess.run(command, capture_output=True, text=True, **kwargs)  # type: ignore[call-overload]
+    if result.returncode != 0:
+        raise Failure(f"{' '.join(command)}: {(result.stderr or result.stdout).strip()}")
+    return result
+
+
+def stop_sessions(name: str) -> None:
+    """Ends the account's SFTP sessions and waits for its processes to go: userdel refuses before."""
+    subprocess.run(["pkill", "-u", name], capture_output=True)
+    for _ in range(20):
+        if subprocess.run(["pgrep", "-u", name], capture_output=True).returncode != 0:
+            return
+        time.sleep(0.5)
+    subprocess.run(["pkill", "-KILL", "-u", name], capture_output=True)
+    time.sleep(1)
+
+
+def backup_account(cfg: Config, name: str) -> Account:
+    if name not in {a.name for a in cfg.accounts()}:
+        raise Failure(f"{name} is not a backup account (a user in the group {GROUP})")
+    return cfg.account(name)
+
+
+def ensure_layout(account: Account) -> None:
+    """chroot root:root 755 (sshd insists), upload/ the account's own, dev/ for its log socket, the vault root's."""
+    user = pwd.getpwnam(account.name) if not TESTING else None
+    for folder, owner, mode in ((account.chroot, None, 0o755), (account.upload, user, 0o700), (account.chroot / "dev", None, 0o755)):
+        folder.mkdir(parents=True, exist_ok=True)
+        if not TESTING:
+            os.chown(folder, user.pw_uid if owner else 0, user.pw_gid if owner else 0)  # type: ignore[union-attr]
+        os.chmod(folder, mode)
+    make_private_dir(account.vault)
+
+
+def key_options(allow_from: list[str]) -> str:
+    return "restrict" + (f',from="{",".join(allow_from)}"' if allow_from else "")
+
+
+def read_key(name: str) -> str | None:
+    """The account's public key without its options."""
+    try:
+        line = (KEYS / name).read_text().strip()
+    except FileNotFoundError:
+        return None
+    match = re.search(r"((?:ssh|ecdsa|sk)-\S+\s+\S+.*)$", line)
+    return match.group(1) if match else None
+
+
+def write_key(name: str, key: str, allow_from: list[str]) -> None:
+    KEYS.mkdir(parents=True, exist_ok=True)
+    os.chmod(KEYS, 0o755)
+    path = KEYS / name
+    path.write_text(f"{key_options(allow_from)} {key}\n")
+    os.chmod(path, 0o644)
+
+
+def check_key(key: str) -> str:
+    key = " ".join(key.split())
+    with tempfile.NamedTemporaryFile("w", suffix=".pub") as fh:
+        fh.write(key + "\n")
+        fh.flush()
+        if subprocess.run(["ssh-keygen", "-l", "-f", fh.name], capture_output=True).returncode != 0:
+            raise Failure("that is not an SSH public key (one line: ssh-ed25519 AAAA... comment)")
+    return key
+
+
+def caller_address() -> str | None:
+    """The address the administrator running this came from (SSH_CONNECTION of their session)."""
+    pid = os.getpid()
+    for _ in range(16):
+        try:
+            for item in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0"):
+                if item.startswith(b"SSH_CONNECTION="):
+                    return item.split(b"=", 1)[1].split()[0].decode()
+            pid = int(re.search(r"^PPid:\s*(\d+)", Path(f"/proc/{pid}/status").read_text(), re.M).group(1))  # type: ignore[union-attr]
+        except (OSError, AttributeError, ValueError):
+            return None
+        if pid <= 1:
+            return None
+    return None
+
+
+def check_lockout(networks: list[str]) -> None:
+    """From an account's addresses only backup accounts may log in: never the administrator's own."""
+    address = caller_address()
+    if not address:
+        return
+    for item in networks:
+        if ipaddress.ip_address(address) in ipaddress.ip_network(item, strict=False):
+            raise Failure(f"{item} holds your own address ({address}): from there only backup accounts could log in, so you would be locked out")
+
+
+def sshd_access(accounts: list[Account]) -> str:
+    pinned = [a for a in accounts if a.allow_from and a.name != SELFTEST]
+    lines = [
+        "# Generated by `backup-vault apply` from /etc/backup-vault/backup-vault.conf (allow_from); edit that, not this.",
+        "# Each backup account logs in only from its own server, and those servers log in only as backup accounts.",
+    ]
+    addresses = sorted({address for a in pinned for address in a.allow_from})
+    if addresses:
+        lines += [f"Match Address {','.join(addresses)}", f"    AllowGroups {GROUP}"]
+    for a in pinned:
+        lines += [f"Match User {a.name} Address *,{','.join('!' + x for x in a.allow_from)}", "    DenyUsers *"]
+    return "\n".join(lines) + "\n"
+
+
+def rsyslog_sockets(accounts: list[Account]) -> str:
+    lines = ["# Generated by `backup-vault apply`: a log socket in each backup account's chroot, so that its", "# SFTP session can log what it does (in /var/log/auth.log, as internal-sftp)."]
+    lines += [f'input(type="imuxsock" Socket="{a.chroot / "dev" / "log"}" CreatePath="on")' for a in accounts if a.name != SELFTEST]
+    return "\n".join(lines) + "\n"
+
+
+def replace_file(path: Path, text: str, valid=None) -> bool:
+    """Writes path when its text changes; valid() refusing the result restores the old text."""
+    old = path.read_text() if path.exists() else None
+    if old == text:
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    part = path.with_name(path.name + ".new")
+    part.write_text(text)
+    os.chmod(part, 0o644)
+    os.rename(part, path)
+    if valid is not None and not valid():
+        if old is None:
+            path.unlink()
+        else:
+            path.write_text(old)
+        raise Failure(f"the new {path} was refused; the previous one is back")
+    return True
+
+
+def sshd_unit() -> str:
+    """ssh.service on Debian and Ubuntu, sshd.service on most others."""
+    for unit in ("ssh.service", "sshd.service"):
+        if subprocess.run(["systemctl", "cat", unit], capture_output=True).returncode == 0:
+            return unit
+    return "sshd.service"
+
+
+def reload_sshd() -> None:
+    """New connections get the new rules; open sessions stay. A socket-activated sshd reads them at its next start."""
+    run(["systemctl", "try-reload-or-restart", sshd_unit()])
+
+
+def sshd_valid() -> bool:
+    result = subprocess.run([SSHD, "-t"], capture_output=True, text=True)
+    if result.returncode != 0:
+        log("error", f"sshd -t: {result.stderr.strip()}")
+    return result.returncode == 0
+
+
+def apply(cfg: Config) -> int:
+    """Brings the system in line with the settings: folders, keys' options, sshd's and rsyslog's rules."""
+    require_root()
+    accounts = cfg.accounts()
+    for account in accounts:
+        ensure_layout(account)
+        key = read_key(account.name)
+        if key and account.name != SELFTEST:
+            write_key(account.name, key, account.allow_from)
+    check_lockout([x for a in accounts for x in a.allow_from])
+    if replace_file(SSHD_ACCESS, sshd_access(accounts), valid=None if TESTING else sshd_valid):
+        if not TESTING:
+            reload_sshd()
+        log("notice", f"updated {SSHD_ACCESS} and reloaded sshd")
+    # Chrooted SFTP sessions log through a socket in their chroot, which rsyslog provides.
+    if RSYSLOG.parent.is_dir() and replace_file(RSYSLOG, rsyslog_sockets(accounts)):
+        if not TESTING:
+            subprocess.run(["systemctl", "try-restart", "rsyslog.service"], capture_output=True)
+        log("notice", f"updated {RSYSLOG} and restarted rsyslog")
+    return 0
+
+
+def edit_section(name: str, key: str, value: str | None, remove: bool = False) -> None:
+    """Sets (value), clears (None) or removes (remove) in [account name] of the settings file, keeping its comments."""
+    lines = CONF.read_text(encoding="utf-8").splitlines() if CONF.exists() else []
+    header = re.compile(rf"^\s*\[\s*account\s+{re.escape(name)}\s*\]\s*$")
+    start = next((i for i, line in enumerate(lines) if header.match(line)), None)
+    if start is None:
+        if remove or value is None:
+            return
+        lines += ["", f"[account {name}]"]
+        start = len(lines) - 1
+    end = next((i for i in range(start + 1, len(lines)) if re.match(r"^\s*\[", lines[i])), len(lines))
+    if remove:
+        del lines[start:end]
+    else:
+        setting = re.compile(rf"^\s*{re.escape(key)}\s*[=:]")
+        at = next((i for i in range(start + 1, end) if setting.match(lines[i])), None)
+        if at is not None:
+            if value is None:
+                del lines[at]
+            else:
+                lines[at] = f"{key} = {value}"
+        elif value is not None:
+            lines.insert(start + 1, f"{key} = {value}")
+    text = "\n".join(lines).rstrip("\n") + "\n"
+    part = CONF.with_name(CONF.name + ".new")
+    part.write_text(text, encoding="utf-8")
+    try:
+        Config(part)
+    except Failure:
+        part.unlink()
+        raise
+    os.chmod(part, 0o644)
+    os.rename(part, CONF)
+
+
+def add_user(cfg: Config, name: str, allow_from: list[str], key: str | None, set_by: str, password: bool) -> int:
+    require_root()
+    if not ACCOUNT_NAME.match(name) or name == SELFTEST:
+        raise Failure(f"{name}: use lower-case letters, digits, _ or - (at most 32)")
+    try:
+        pwd.getpwnam(name)
+        raise Failure(f"a user named {name} already exists")
+    except KeyError:
+        pass
+    check_value("account", "allow_from", ",".join(allow_from))
+    check_value("account", "set_by", set_by)
+    key = check_key(key) if key else None
+    check_lockout(allow_from)
+    run(["useradd", "--no-create-home", "--home-dir", "/nonexistent", "--gid", GROUP, "--shell", "/usr/sbin/nologin", "--comment", "backup account (backup-vault)", name])
+    edit_section(name, "set_by", set_by)
+    edit_section(name, "allow_from", ", ".join(allow_from) if allow_from else None)
+    cfg = Config()
+    if key:
+        write_key(name, key, allow_from)
+    apply(cfg)
+    if password:
+        print(f"Choose a long random password for {name} (it is typed into the site's backup settings, not remembered):")
+        subprocess.run(["passwd", name])
+    host = cfg.server("public_host") or "<this server's address>"
+    print(f"\nBackup account {name} is ready. In the backup client's settings (SFTP):")
+    print(f"  server {host}, port {cfg.server('public_port')}, user {name}, folder {UPLOAD}")
+    print("  password: " + ("the one just set" if password else f"none yet (sudo passwd {name}) ") + (" / SSH key: installed" if key else ""))
+    if not allow_from:
+        print("  Logs in from any address the firewall allows; pin it to its server: sudo backup-vault set-ip " + name + " ADDRESS")
+    return 0
+
+
+def set_ip(cfg: Config, name: str, addresses: list[str]) -> int:
+    require_root()
+    backup_account(cfg, name)
+    allow = [] if addresses == ["none"] else addresses
+    check_value("account", "allow_from", ",".join(allow))
+    check_lockout(allow)
+    edit_section(name, "allow_from", ", ".join(allow) if allow else None)
+    apply(Config())
+    print(f"{name} now logs in from: {', '.join(allow) or 'any address the firewall allows'} (also update the provider's firewall)")
+    return 0
+
+
+def set_key(cfg: Config, name: str, key: str) -> int:
+    require_root()
+    account = backup_account(cfg, name)
+    if key == "none":
+        (KEYS / name).unlink(missing_ok=True)
+        print(f"{name}: SSH key removed")
+        return 0
+    key = check_key(sys.stdin.read() if key == "-" else key)
+    write_key(name, key, account.allow_from)
+    print(f"{name}: SSH key installed ({key_options(account.allow_from)})")
+    return 0
+
+
+def disable_user(cfg: Config, name: str, enable: bool) -> int:
+    require_root()
+    backup_account(cfg, name)
+    run(["usermod", "--expiredate", "" if enable else "1", name])
+    if not enable:
+        stop_sessions(name)
+    print(f"{name}: login {'allowed again' if enable else 'refused (its backups stay in the vault)'}")
+    return 0
+
+
+def remove_user(cfg: Config, name: str, delete_backups: bool) -> int:
+    """Removes a backup account. Its backups stay in the vault (outside rotation) unless delete_backups."""
+    require_root()
+    account = backup_account(cfg, name)
+    stop_sessions(name)
+    ingest(cfg, only={name}, migrate=True)
+    leftovers = scan(account.upload)[0] if account.upload.is_dir() else []
+    if leftovers:
+        raise Failure(f"{account.upload} still holds files; nothing removed")
+    run(["userdel", name])
+    (KEYS / name).unlink(missing_ok=True)
+    shutil.rmtree(account.chroot, ignore_errors=True)
+    edit_section(name, "", None, remove=True)
+    if delete_backups:
+        unlock_tree(account.vault)
+        shutil.rmtree(account.vault, ignore_errors=True)
+        (STATE / f"{name}.jsonl").unlink(missing_ok=True)
+    apply(Config())
+    print(f"{name} removed" + ("" if delete_backups else f"; its backups stay in {account.vault} (rotation no longer touches them)"))
+    return 0
+
+
+def copy_out(cfg: Config, name: str, wanted: str, destination: str) -> int:
+    """Copies one backup out of the vault for a restore, owned by the administrator running sudo."""
+    require_root()
+    account = cfg.account(name)
+    backup = next((s for s in collect_sets(account) if s.name == wanted), None)
+    if backup is None:
+        raise Failure(f"{name} has no backup named {wanted} (see: sudo backup-vault list {name})")
+    target_dir = Path(destination).resolve()
+    if VAULT in (target_dir, *target_dir.parents) or SFTP_ROOT in (target_dir, *target_dir.parents):
+        raise Failure("copy it outside the vault and the SFTP folders")
+    if not target_dir.is_dir():
+        raise Failure(f"{target_dir} is not a folder (make it first: mkdir {target_dir})")
+    target = target_dir / Path(wanted).name
+    if target.exists():
+        raise Failure(f"{target} already exists")
+    if backup.path.is_dir():
+        shutil.copytree(backup.path, target, copy_function=shutil.copy2)
+        copied = [target, *scan(target)[2], *(p for p, _ in scan(target)[0])]
+    else:
+        shutil.copy2(backup.path, target)
+        copied = [target]
+    uid, gid = int(os.environ.get("SUDO_UID", "0")), int(os.environ.get("SUDO_GID", "0"))
+    for path in copied:
+        os.chmod(path, 0o700 if path.is_dir() else 0o600)
+        if not TESTING:
+            os.chown(path, uid, gid)
+    print(f"copied {wanted} ({human(backup.size)}, received {when(backup.arrival)}) to {target}")
+    return 0
+
+
+# ---------------------------------------------------------------- self-test
+
+
+def sshd_effective(user: str, address: str) -> str:
+    result = subprocess.run([SSHD, "-T", "-C", f"user={user},host={address},addr={address}"], capture_output=True, text=True)
+    return result.stdout.lower()
+
+
+def remove_selftest_account() -> None:
+    """Undoes the self-test: its user, key, folders, vault copies and history (test data only)."""
+    try:
+        user = pwd.getpwnam(SELFTEST)
+    except KeyError:
+        user = None
+    if user is not None and user.pw_gecos != SELFTEST_COMMENT:
+        raise Failure(f"a user named {SELFTEST} exists and is not the self-test's; the self-test will not touch it")
+    stop_sessions(SELFTEST)
+    for folder in [VAULT / SELFTEST, *TRASH.glob(f"*/{SELFTEST}")]:
+        unlock_tree(folder)
+        shutil.rmtree(folder, ignore_errors=True)
+    shutil.rmtree(SFTP_ROOT / SELFTEST, ignore_errors=True)
+    (KEYS / SELFTEST).unlink(missing_ok=True)
+    (STATE / f"{SELFTEST}.jsonl").unlink(missing_ok=True)
+    if user is None:
+        return
+    result = subprocess.run(["userdel", SELFTEST], capture_output=True, text=True)
+    if result.returncode != 0:
+        log("warning", f"userdel {SELFTEST}: {result.stderr.strip()} (run `sudo backup-vault selftest` again to clean up)")
+
+
+def selftest_endpoint() -> tuple[str, str]:
+    """Where sshd listens on this machine: loopback when it listens on every address."""
+    listen = [line.split()[1] for line in subprocess.run([SSHD, "-T"], capture_output=True, text=True).stdout.splitlines() if line.startswith("listenaddress ")]
+    for value in listen:
+        address, _, port = value.rpartition(":")
+        address = address.strip("[]")
+        if address in ("0.0.0.0", "127.0.0.1"):
+            return "127.0.0.1", port
+        if address in ("::", "::1"):
+            return "::1", port
+    if listen:
+        address, _, port = listen[0].rpartition(":")
+        return address.strip("[]"), port
+    return "127.0.0.1", "22"
+
+
+def selftest(cfg: Config) -> int:
+    """Logs in as a temporary backup account and tries what an attacker on a site's server would."""
+    require_root()
+    host, port = selftest_endpoint()
+    work = Path(tempfile.mkdtemp(prefix="backup-vault-selftest-"))
+    results = {"passed": 0, "failed": 0}
+
+    def check(label: str, ok: bool, detail: str = "") -> None:
+        results["passed" if ok else "failed"] += 1
+        print(f"  {'ok  ' if ok else 'FAIL'}  {label}" + ("" if ok or not detail else f"  ({show(detail.strip())[:300]})"))
+
+    try:
+        remove_selftest_account()
+        run(["useradd", "--no-create-home", "--home-dir", "/nonexistent", "--gid", GROUP, "--shell", "/usr/sbin/nologin", "--comment", SELFTEST_COMMENT, SELFTEST])
+        account = cfg.account(SELFTEST)
+        ensure_layout(account)
+        key = work / "key"
+        run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "backup-vault selftest", "-f", str(key)])
+        write_key(SELFTEST, key.with_name("key.pub").read_text().strip(), [host])
+        sample = work / "sample.zip"
+        with zipfile.ZipFile(sample, "w") as archive:
+            archive.writestr("hello.txt", "backup-vault self-test\n")
+        options = ["-i", str(key), "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                   "-o", f"UserKnownHostsFile={work / 'known_hosts'}", "-o", "ConnectTimeout=10", "-o", "LogLevel=ERROR"]
+        target = f"{SELFTEST}@{host}" if ":" not in host else f"{SELFTEST}@[{host}]"
+
+        def sftp(*commands: str) -> subprocess.CompletedProcess:
+            return subprocess.run(["sftp", "-P", port, *options, "-b", "-", target], input="\n".join(commands) + "\n", capture_output=True, text=True, timeout=60)
+
+        def ssh(extra: list[str], command: list[str]) -> subprocess.CompletedProcess:
+            arguments = ["ssh", "-p", port, *options, *extra, target, *command]
+            try:
+                return subprocess.run(arguments, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+            except subprocess.TimeoutExpired:
+                return subprocess.CompletedProcess(arguments, 0, "", "timed out: the server went along with it")
+
+        print(f"Self-test as a temporary backup account ({SELFTEST}) over SSH to {host}, port {port}:")
+        # A chrooted session starts at /; the account writes only under upload/ (as the sites do).
+        r = sftp(f"mkdir {UPLOAD}/set-1", f"put {sample} {UPLOAD}/set-1/backup.zip")
+        check("it uploads a backup", r.returncode == 0, r.stderr)
+        r = sftp(f"ls -l {UPLOAD}/set-1")
+        check("it lists its upload folder", r.returncode == 0 and "backup.zip" in r.stdout, r.stderr)
+        check("it cannot download", sftp(f"get {UPLOAD}/set-1/backup.zip {work / 'downloaded'}").returncode != 0)
+        check("it cannot delete a file", sftp(f"rm {UPLOAD}/set-1/backup.zip").returncode != 0)
+        check("it cannot delete a folder", sftp(f"rmdir {UPLOAD}/set-1").returncode != 0)
+        check("it cannot make a symbolic link", sftp(f"symlink {UPLOAD}/set-1/backup.zip {UPLOAD}/link").returncode != 0)
+        check("it cannot make a hard link", sftp(f"ln {UPLOAD}/set-1/backup.zip {UPLOAD}/hard").returncode != 0)
+        check("it cannot write outside upload/", sftp(f"put {sample} /outside.zip").returncode != 0)
+        r = sftp(f"ls -l {UPLOAD}/set-1")
+        check("and the backup is still there", "backup.zip" in r.stdout, r.stdout + r.stderr)
+        r = sftp("ls -1 /")
+        seen = {line.strip().rstrip("/").rsplit("/", 1)[-1] for line in r.stdout.splitlines() if line.strip() and not line.startswith("sftp>")}
+        check("it sees only its own upload folder", r.returncode == 0 and seen <= {UPLOAD, "dev"}, r.stdout)
+        r = ssh([], ["id"])
+        check("it gets no shell", r.returncode != 0 and "uid=" not in r.stdout, r.stdout + r.stderr)
+        r = ssh(["-N", "-o", "ExitOnForwardFailure=yes", "-R", "127.0.0.1:0:127.0.0.1:9"], [])
+        check("it cannot forward ports", r.returncode != 0, r.stderr)
+        effective = sshd_effective(SELFTEST, host)
+        check("sshd: SFTP only, chrooted, nothing forwarded", "forcecommand internal-sftp" in effective and "-p read,readlink,remove,rmdir" in effective and "chrootdirectory /var/backups/sftp/%u" in effective and "disableforwarding yes" in effective)
+
+        ingest(cfg, only={SELFTEST}, settle=0)
+        stored = account.vault / "set-1" / "backup.zip"
+        check("the backup moved into the vault", stored.is_file() and not (account.upload / "set-1" / "backup.zip").exists())
+        if stored.is_file():
+            st = os.stat(stored)
+            check("there it is root's and read-only", st.st_uid == 0 and stat.S_IMODE(st.st_mode) == 0o400)
+            check("and immutable (chattr +i)", is_immutable(stored))
+            check("its SHA-256 is recorded", stored_hashes(SELFTEST).get("set-1/backup.zip") == sha256(sample))
+        check("the account no longer sees it", "backup.zip" not in sftp(f"ls -l {UPLOAD}/set-1").stdout)
+
+        admin = os.environ.get("SUDO_USER") or "root"
+        for other in cfg.accounts():
+            address = other.allow_from[0].split("/")[0] if other.allow_from else "203.0.113.9"
+            effective = sshd_effective(other.name, address)
+            check(f"{other.name}: SFTP only and chrooted", "forcecommand internal-sftp" in effective and "chrootdirectory /var/backups/sftp/%u" in effective)
+            check(f"{other.name}: its SFTP session logs", (other.chroot / "dev" / "log").is_socket())
+            if other.allow_from:
+                check(f"{other.name}: refused from another address", "denyusers *" in sshd_effective(other.name, "203.0.113.9"))
+                check(f"{admin} cannot log in from {address}", f"allowgroups {GROUP}" in sshd_effective(admin, address))
+    finally:
+        remove_selftest_account()
+        shutil.rmtree(work, ignore_errors=True)
+    print(f"{results['passed']} passed, {results['failed']} failed")
+    return 1 if results["failed"] else 0
+
+
+# ---------------------------------------------------------------- command line
+
+
+def lock(wait: bool):
+    LOCK.parent.mkdir(parents=True, exist_ok=True)
+    handle = LOCK.open("a")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+    except BlockingIOError:
+        handle.close()
+        return None
+    return handle
+
+
+def main(argv: list[str] | None = None) -> int:
+    os.umask(0o077)
+    parser = argparse.ArgumentParser(prog="backup-vault", description=f"SFTP Backup Vault: upload-only SFTP backup accounts, an immutable vault and rotation. Guide: /etc/backup-vault/README.md, {PROJECT}")
+    parser.add_argument("--version", action="version", version=f"backup-vault {VERSION}")
+    sub = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
+    sub.add_parser("status", help="each account's backups, the disk and any warning").add_argument("--brief", action="store_true", help="one line (the login message)")
+    sub.add_parser("list", help="an account's backups, newest first").add_argument("account")
+    sub.add_parser("policy", help="the settings each account works with")
+    p = sub.add_parser("ingest", help="move finished uploads into the vault (the timer does it every minute)")
+    p.add_argument("--account", action="append")
+    p.add_argument("--settle", type=int, help="seconds unchanged before a file is taken (default: settle_seconds)")
+    p.add_argument("--migrate", action="store_true", help="take every closed file now, dated by its modification time")
+    p = sub.add_parser("rotate", help="keep the retention selection, put the rest in the trash (the timer does it nightly)")
+    p.add_argument("--dry-run", action="store_true", help="only show what it would do")
+    p.add_argument("--force", action="store_true", help="also with an unsynchronised clock")
+    p.add_argument("--account", action="append")
+    sub.add_parser("verify", help="hash every stored file again and compare (the timer does it weekly)").add_argument("--account", action="append")
+    sub.add_parser("apply", help="bring folders, keys, sshd's and rsyslog's rules in line with the settings")
+    p = sub.add_parser("add-user", help="create a backup account")
+    p.add_argument("name")
+    p.add_argument("--from", dest="allow_from", default="", help="the site server's address(es), comma-separated")
+    p.add_argument("--key", help="its SSH public key (one line)")
+    p.add_argument("--set-by", choices=("file", "folder"), default="file", help="a backup is one file (default) or one top folder")
+    p.add_argument("--password", action="store_true", help="also set a password now")
+    p = sub.add_parser("set-ip", help="the address(es) an account logs in from (none: any)")
+    p.add_argument("name")
+    p.add_argument("addresses", nargs="+")
+    p = sub.add_parser("set-key", help="an account's SSH public key (- reads it from stdin, none removes it)")
+    p.add_argument("name")
+    p.add_argument("key")
+    sub.add_parser("disable-user", help="refuse an account's logins (its backups stay)").add_argument("name")
+    sub.add_parser("enable-user", help="allow a disabled account again").add_argument("name")
+    p = sub.add_parser("remove-user", help="remove an account (its backups stay unless --delete-backups)")
+    p.add_argument("name")
+    p.add_argument("--delete-backups", action="store_true")
+    p = sub.add_parser("copy-out", help="copy one backup out of the vault, for a restore")
+    p.add_argument("account")
+    p.add_argument("backup", help="its name as `list` shows it")
+    p.add_argument("destination", help="a folder outside the vault")
+    sub.add_parser("selftest", help="try a temporary account's rights against the real sshd")
+    args = parser.parse_args(argv)
+
+    try:
+        if args.command != "policy":
+            require_root()
+        cfg = Config()
+        only = set(args.account) if args.command in ("ingest", "rotate", "verify") and args.account else None
+        if args.command == "status":
+            return status(cfg, args.brief)
+        if args.command == "list":
+            return list_sets(cfg, args.account)
+        if args.command == "policy":
+            return policy(cfg)
+        if args.command == "copy-out":
+            return copy_out(cfg, args.account, args.backup, args.destination)
+        if args.command in ("disable-user", "enable-user"):
+            return disable_user(cfg, args.name, enable=args.command == "enable-user")
+        handle = lock(wait=args.command != "ingest")
+        if handle is None:
+            return 0  # the previous ingest is still running; this one is not needed
+        with handle:
+            if args.command == "ingest":
+                return ingest(cfg, only, args.migrate, args.settle)
+            if args.command == "rotate":
+                return rotate(cfg, args.dry_run, args.force, only)
+            if args.command == "verify":
+                return verify(cfg, only)
+            if args.command == "apply":
+                return apply(cfg)
+            if args.command == "add-user":
+                return add_user(cfg, args.name, split_list(args.allow_from), args.key, args.set_by, args.password)
+            if args.command == "set-ip":
+                return set_ip(cfg, args.name, [x for a in args.addresses for x in split_list(a)])
+            if args.command == "set-key":
+                return set_key(cfg, args.name, args.key)
+            if args.command == "remove-user":
+                return remove_user(cfg, args.name, args.delete_backups)
+            if args.command == "selftest":
+                return selftest(cfg)
+    except Failure as e:
+        log("error", str(e))
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

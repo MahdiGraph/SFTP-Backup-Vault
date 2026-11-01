@@ -1,0 +1,24 @@
+name: One-line install
+
+# The README's one-liner, against the published release, on a clean machine.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  curl-install:
+    name: curl | sudo bash on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    steps:
+      - name: Install
+        run: curl -fsSL https://raw.githubusercontent.com/MahdiGraph/SFTP-Backup-Vault/main/install.sh | sudo bash -s -- --yes
+      - name: Check
+        run: |
+          backup-vault --version
+          sudo backup-vault status || true
+          sudo backup-vault selftest

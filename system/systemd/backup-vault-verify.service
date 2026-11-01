@@ -1,0 +1,13 @@
+[Unit]
+Description=backup-vault: hash the stored backups again and compare
+Documentation=file:/etc/backup-vault/README.md https://github.com/MahdiGraph/SFTP-Backup-Vault
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/backup-vault verify
+Nice=15
+IOSchedulingClass=idle
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes

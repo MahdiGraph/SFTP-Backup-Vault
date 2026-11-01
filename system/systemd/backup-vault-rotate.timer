@@ -1,0 +1,10 @@
+[Unit]
+Description=backup-vault: rotate the backups every night
+
+[Timer]
+# Early morning, after most nightly backups; change it with: systemctl edit backup-vault-rotate.timer
+OnCalendar=*-*-* 05:15:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

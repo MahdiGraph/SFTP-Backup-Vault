@@ -1,0 +1,15 @@
+[Unit]
+Description=backup-vault: move finished SFTP uploads into the vault
+Documentation=file:/etc/backup-vault/README.md https://github.com/MahdiGraph/SFTP-Backup-Vault
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/backup-vault ingest
+# What it stores, warns about or fails at reaches the journal; not a line a minute about starting.
+LogLevelMax=notice
+Nice=10
+IOSchedulingClass=idle
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes

@@ -1,0 +1,5 @@
+#!/bin/sh
+# SFTP Backup Vault: the backups' state in the login message (/etc/backup-vault/README.md).
+[ -x /usr/local/sbin/backup-vault ] || exit 0
+echo
+timeout 5 /usr/local/sbin/backup-vault status --brief 2>&1 || true

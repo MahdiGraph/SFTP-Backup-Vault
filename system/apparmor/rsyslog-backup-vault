@@ -1,0 +1,3 @@
+# SFTP Backup Vault: rsyslog's log sockets in the SFTP backup accounts' chroots (/etc/rsyslog.d/40-backup-vault.conf).
+/var/backups/sftp/*/dev/ rw,
+/var/backups/sftp/*/dev/log rwl,

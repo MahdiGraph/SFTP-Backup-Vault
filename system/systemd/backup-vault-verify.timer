@@ -1,0 +1,9 @@
+[Unit]
+Description=backup-vault: check the stored backups every week
+
+[Timer]
+OnCalendar=Fri *-*-* 06:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
